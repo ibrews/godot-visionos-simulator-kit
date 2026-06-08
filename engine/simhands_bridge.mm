@@ -52,12 +52,14 @@ static const float SIMHANDS_DEF_PLANE_M = 0.55f;
 static const float SIMHANDS_DEF_DEPTH_M = 0.45f;
 static const float SIMHANDS_DEF_Y_OFFSET_M = -0.10f;
 static const float SIMHANDS_DEF_Z_SHAPE_GAIN = 1.0f;
+static const float SIMHANDS_DEF_SMOOTHING = 0.9f;
 
 static float SIMHANDS_HAND_KNUCKLE_M = SIMHANDS_DEF_KNUCKLE_M; // target wrist->middle-knuckle length (self-normalize → metric hand)
 static float SIMHANDS_PLANE_M = SIMHANDS_DEF_PLANE_M; // image plane → head-space placement scale (hand x,y in ~±0.275 m)
 static float SIMHANDS_DEPTH_M = SIMHANDS_DEF_DEPTH_M; // wrist distance in front of the XR origin
 static float SIMHANDS_Y_OFFSET_M = SIMHANDS_DEF_Y_OFFSET_M; // head-relative vertical offset before floor offset
 static float SIMHANDS_Z_SHAPE_GAIN = SIMHANDS_DEF_Z_SHAPE_GAIN; // how much MediaPipe z drives finger-curl depth
+static float SIMHANDS_SMOOTHING = SIMHANDS_DEF_SMOOTHING; // hand stabilizer: 0 = raw (no smoothing), 1 = max; live-tunable via the panel "smoothing" slider
 
 // Pinch thresholds for the controller "trigger" proxy (local copy of the
 // engine's VISIONOS_PINCH_* — the game itself reads the hand-tracker joint
@@ -104,9 +106,40 @@ static const int SIMHANDS_DIR_FROM[21] = { 0, 1, 2, 3, 3, 5, 6, 7, 7, 9, 10, 11,
 static const int SIMHANDS_DIR_TO[21] = { 9, 2, 3, 4, 4, 6, 7, 8, 8, 10, 11, 12, 12, 14, 15, 16, 16, 18, 19, 20, 20 };
 
 // Parent landmark of each MediaPipe joint along its finger chain (wrist=0 = root). Used by the
-// out-of-frame tendril guard (apply_simhands_hand_states) to test each bone segment against the
-// hand's own scale: index < li for every entry, so a wrist→tip walk clamps parents before children.
+// off-frame gating in apply_simhands_hand_states: index < li for every entry, so when a landmark
+// that has never yet been seen in-frame must fall back onto its parent, the parent's gated position
+// is already resolved (we walk li = 0..20 in order).
 static const int SIMHANDS_PARENT[21] = { -1, 0, 1, 2, 3, 0, 5, 6, 7, 0, 9, 10, 11, 0, 13, 14, 15, 0, 17, 18, 19 };
+
+// ---------------------------------------------------------------------------
+// Hand-feed source selection (multi-tool coexistence).
+// ---------------------------------------------------------------------------
+// The bridge auto-connects to EVERY advertised "Bonjour" peer — the real VisionOS-SimHands helper,
+// the SimControlPanel canned feed, the canned-sender CLI, even stray host advertisers — and they all
+// land in one _latest (last-write-wins). With >1 peer streaming hands, their frames fight frame-by-
+// frame (observed jitter between the real and canned poses). So exactly ONE peer may drive at a time:
+//   (1) a time-based single-source LOCK — the first peer to send a non-empty hand wins and holds the
+//       lock until it goes quiet (no data for SIMHANDS_LOCK_TIMEOUT_S), then a new winner may claim it;
+//   (2) an optional FORCED source — the SimControlPanel "Hand source" picker sends a UDP "H" verb
+//       (H0/H1/H2) → simulator_input.gd → user://simhands_calibration.cfg "source" → here, restricting
+//       which peers may win. AUTO (no cfg / no panel) keeps the zero-config behavior: any peer wins.
+enum SimHandsSource {
+	SIMHANDS_SRC_AUTO = -1, // no restriction — first non-empty peer wins (default; zero-config)
+	SIMHANDS_SRC_OFF = 0, // ignore all feeds — hands hidden
+	SIMHANDS_SRC_CANNED = 1, // only the local canned feeds (SimControlPanel / SimHandsCanned)
+	SIMHANDS_SRC_WEBCAM = 2, // only the real helper (any peer that is NOT a known canned feed)
+};
+static const NSTimeInterval SIMHANDS_LOCK_TIMEOUT_S = 1.0; // locked peer "quiet" this long → release
+
+// Known local/deterministic canned-feed peer names. "Canned" accepts exactly these; "Webcam" accepts
+// anything else (the real VisionOS-SimHands helper, whatever host-derived name it advertises).
+static bool simhands_is_canned_peer(NSString *name) {
+	return [name isEqualToString:@"SimControlPanel"] || [name isEqualToString:@"SimHandsCanned"];
+}
+
+// Live forced-source, mirrored from the cfg by simhands_reload_calibration() and pushed to the MC
+// client each frame by apply_simhands_hand_states(). AUTO until the panel says otherwise.
+static int simhands_forced_source = SIMHANDS_SRC_AUTO;
 
 // Plain-old-data carried from the MC delegate queue → the engine main thread.
 struct SimHandsLandmark {
@@ -175,11 +208,17 @@ static Basis simhands_basis_from_dir(const Vector3 &p_distal, const Vector3 &p_r
 	os_unfair_lock _lock;
 	SimHandsPodFrame _latest;
 	BOOL _hasFrame;
+	// Single-source lock + forced-source filter (multi-feed coexistence). All guarded by _lock.
+	NSString *_lockedPeer; // displayName of the peer currently driving the trackers; nil = unlocked
+	NSTimeInterval _lastDataTime; // systemUptime of the last ACCEPTED frame (drives lock liveness)
+	int _forcedSource; // SimHandsSource: AUTO/-1 (any) · OFF/0 · CANNED/1 · WEBCAM/2
 }
 - (instancetype)initWithService:(NSString *)serviceType;
 - (void)start;
 - (void)stop;
 - (BOOL)copyLatestFrame:(SimHandsPodFrame *)outFrame;
+- (void)setForcedSource:(int)src; // restrict which peers may win the lock (from the panel picker)
+- (NSString *)lockedPeerName; // displayName of the current winner (diagnostics); nil if none
 @end
 
 @implementation GodotSimHandsClient
@@ -190,6 +229,9 @@ static Basis simhands_basis_from_dir(const Vector3 &p_distal, const Vector3 &p_r
 		_serviceType = serviceType;
 		_lock = OS_UNFAIR_LOCK_INIT;
 		_hasFrame = NO;
+		_lockedPeer = nil;
+		_lastDataTime = 0;
+		_forcedSource = SIMHANDS_SRC_AUTO;
 		_peerID = [[MCPeerID alloc] initWithDisplayName:@"GodotVisionPilot"];
 		_session = [[MCSession alloc] initWithPeer:_peerID securityIdentity:nil encryptionPreference:MCEncryptionNone];
 		_session.delegate = self;
@@ -225,6 +267,30 @@ static Basis simhands_basis_from_dir(const Vector3 &p_distal, const Vector3 &p_r
 	return ok;
 }
 
+// Restrict which peers may win the single-source lock (SimControlPanel "Hand source" picker). A
+// CHANGE drops the current lock so the newly-selected source can take over immediately (instant
+// hand-off) instead of waiting out the quiet timeout.
+- (void)setForcedSource:(int)src {
+	os_unfair_lock_lock(&_lock);
+	if (src != _forcedSource) {
+		_forcedSource = src;
+		_lockedPeer = nil;
+		// Drop the retained frame too: otherwise switching to a source with no active feed (e.g.
+		// Webcam with no helper running) would keep re-applying the OLD source's last frame — a stale
+		// frozen hand. Cleared, apply_simhands_hand_states() finds no data and the per-frame ARKit
+		// reset leaves the hands untracked (gone) until the newly-selected source streams.
+		_hasFrame = NO;
+	}
+	os_unfair_lock_unlock(&_lock);
+}
+
+- (NSString *)lockedPeerName {
+	os_unfair_lock_lock(&_lock);
+	NSString *n = _lockedPeer ? [_lockedPeer copy] : nil;
+	os_unfair_lock_unlock(&_lock);
+	return n;
+}
+
 // --- MCNearbyServiceBrowserDelegate ---
 - (void)browser:(MCNearbyServiceBrowser *)browser foundPeer:(MCPeerID *)peerID withDiscoveryInfo:(NSDictionary<NSString *, NSString *> *)info {
 	os_log(simhands_log(), "[SimHands] found peer '%{public}@' — inviting", peerID.displayName);
@@ -254,6 +320,15 @@ static Basis simhands_basis_from_dir(const Vector3 &p_distal, const Vector3 &p_r
 	const char *s = (state == MCSessionStateConnected) ? "connected" : (state == MCSessionStateConnecting) ? "connecting"
 																									  : "notConnected";
 	os_log(simhands_log(), "[SimHands] peer '%{public}@' → %{public}s", peerID.displayName, s);
+	// If the winning peer drops, release the lock now so another feed can take over without waiting
+	// out the quiet timeout.
+	if (state == MCSessionStateNotConnected) {
+		os_unfair_lock_lock(&_lock);
+		if (_lockedPeer != nil && [_lockedPeer isEqualToString:peerID.displayName]) {
+			_lockedPeer = nil;
+		}
+		os_unfair_lock_unlock(&_lock);
+	}
 }
 
 - (void)session:(MCSession *)session didReceiveData:(NSData *)data fromPeer:(MCPeerID *)peerID {
@@ -318,10 +393,45 @@ static Basis simhands_basis_from_dir(const Vector3 &p_distal, const Vector3 &p_r
 	}
 	frame.hand_count = (uint32_t)nhands;
 
+	// Single-source lock + forced-source filter (see SimHandsSource above). Only ONE peer drives the
+	// trackers at a time, so concurrent feeds (real helper + panel + canned sender) can't fight.
+	const bool has_hand = (frame.hand_count > 0 && frame.hands[0].present);
+	NSString *peer = peerID.displayName;
+	const NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+
 	os_unfair_lock_lock(&_lock);
-	frame.seq = _latest.seq + 1;
-	_latest = frame;
-	_hasFrame = YES;
+	bool source_ok; // does this peer match the panel's forced selection?
+	switch (_forcedSource) {
+		case SIMHANDS_SRC_OFF:
+			source_ok = false;
+			break;
+		case SIMHANDS_SRC_CANNED:
+			source_ok = simhands_is_canned_peer(peer);
+			break;
+		case SIMHANDS_SRC_WEBCAM:
+			source_ok = !simhands_is_canned_peer(peer);
+			break;
+		default: // AUTO
+			source_ok = true;
+			break;
+	}
+	// Free if nobody holds the lock or the holder has gone quiet past the timeout.
+	const bool lock_free = (_lockedPeer == nil) || ((now - _lastDataTime) > SIMHANDS_LOCK_TIMEOUT_S);
+	bool accept = false;
+	if (source_ok) {
+		if (_lockedPeer != nil && [_lockedPeer isEqualToString:peer]) {
+			accept = true; // already the winner — keep it (an empty frame still keeps the lock alive)
+		} else if (lock_free && has_hand) {
+			_lockedPeer = peer; // claim — only a non-empty frame may take the lock
+			accept = true;
+		}
+	}
+	if (accept) {
+		_lastDataTime = now;
+		frame.seq = _latest.seq + 1;
+		_latest = frame;
+		_hasFrame = YES;
+	}
 	os_unfair_lock_unlock(&_lock);
 }
 
@@ -388,6 +498,8 @@ static void simhands_reload_calibration() {
 		SIMHANDS_DEPTH_M = SIMHANDS_DEF_DEPTH_M;
 		SIMHANDS_Y_OFFSET_M = SIMHANDS_DEF_Y_OFFSET_M;
 		SIMHANDS_Z_SHAPE_GAIN = SIMHANDS_DEF_Z_SHAPE_GAIN;
+		SIMHANDS_SMOOTHING = SIMHANDS_DEF_SMOOTHING;
+		simhands_forced_source = SIMHANDS_SRC_AUTO; // no panel / "Reset" → any feed may drive
 		return;
 	}
 	if (err != OK) {
@@ -398,6 +510,8 @@ static void simhands_reload_calibration() {
 	SIMHANDS_DEPTH_M = (float)(double)cf->get_value("simhands", "depth", (double)SIMHANDS_DEF_DEPTH_M);
 	SIMHANDS_Y_OFFSET_M = (float)(double)cf->get_value("simhands", "y_offset", (double)SIMHANDS_DEF_Y_OFFSET_M);
 	SIMHANDS_Z_SHAPE_GAIN = (float)(double)cf->get_value("simhands", "z_gain", (double)SIMHANDS_DEF_Z_SHAPE_GAIN);
+	SIMHANDS_SMOOTHING = (float)(double)cf->get_value("simhands", "smoothing", (double)SIMHANDS_DEF_SMOOTHING);
+	simhands_forced_source = (int)(int64_t)cf->get_value("simhands", "source", (int64_t)SIMHANDS_SRC_AUTO);
 }
 
 void VisionOSXRInterface::apply_simhands_hand_states() {
@@ -408,6 +522,25 @@ void VisionOSXRInterface::apply_simhands_hand_states() {
 	simhands_reload_calibration();
 
 	GodotSimHandsClient *client = (__bridge GodotSimHandsClient *)simhands_client;
+	[client setForcedSource:simhands_forced_source]; // panel picker → restrict which peer drives
+
+	// Always-on source/lock diagnostic (~every 60 frames) so EVERY mode is verifiable — including the
+	// no-hands modes (Off, or Webcam with no helper) that return before the per-hand log below.
+	static uint32_t src_log = 0;
+	if ((src_log++ % 60) == 0) {
+		NSString *locked = [client lockedPeerName];
+		os_log(simhands_log(), "[SimHands] source=%d locked=%{public}@", simhands_forced_source, locked ? locked : @"(none)");
+	}
+
+	// Forced "Off": hide hands regardless of what's still advertising/streaming (the picker's Off
+	// must mean off even if a webcam helper or canned sender is connected).
+	if (simhands_forced_source == SIMHANDS_SRC_OFF) {
+		for (int i = 0; i < HAND_INDEX_MAX; i++) {
+			reset_hand_state((HandIndex)i);
+		}
+		return;
+	}
+
 	SimHandsPodFrame frame;
 	if (![client copyLatestFrame:&frame]) {
 		return; // no data received yet — leave the (empty) ARKit-derived state untouched
@@ -437,18 +570,31 @@ void VisionOSXRInterface::apply_simhands_hand_states() {
 				simhands_baseline_set = true;
 			}
 			head_delta = head_pos - simhands_head_baseline;
+			// The sim head pose is noisy/drifty (observed ~1 m z jump with no real movement), which
+			// shoves the hands behind the viewer and out of sight. Bound the WASD-follow so the hands
+			// can never leave view; ample for real reach, small enough they stay in front.
+			const float HD_MAX = 0.35f;
+			head_delta.x = CLAMP(head_delta.x, -HD_MAX, HD_MAX);
+			head_delta.y = CLAMP(head_delta.y, -HD_MAX, HD_MAX);
+			head_delta.z = CLAMP(head_delta.z, -HD_MAX, HD_MAX);
 		}
 	}
 
 	bool filled[HAND_INDEX_MAX] = { false, false };
 
-	// Out-of-frame tendril guard state, per side (see the guard block in the hand loop for the full
-	// rationale): last-good wrist-relative joint positions for temporal hold, plus two diagnostics
-	// (max bone length this frame, # of bones the guard corrected) surfaced in the os_log line.
-	static Vector3 simhands_lastgood[HAND_INDEX_MAX][21];
-	static bool simhands_have_hist[HAND_INDEX_MAX] = { false, false };
-	static int simhands_guard_hits[HAND_INDEX_MAX] = { 0, 0 };
-	static float simhands_maxbone[HAND_INDEX_MAX] = { 0.0f, 0.0f };
+	// Off-frame gating + smoothing state, per side:
+	//  - uhold/uok: each landmark's last IN-FRAME wrist-relative u-offset (held when it goes off-frame)
+	//  - wrist_hold/wrist_ok: the wrist anchor's last in-frame u (placement stays put if the wrist clips)
+	//  - smooth/smooth_ok: previous smoothed metric positions for the velocity-adaptive EMA
+	//  - held/maxfinger: diagnostics surfaced in the os_log line (held landmarks; max cumulative finger)
+	static Vector3 simhands_uhold[HAND_INDEX_MAX][21];
+	static bool simhands_uok[HAND_INDEX_MAX][21] = {};
+	static Vector3 simhands_wrist_hold[HAND_INDEX_MAX];
+	static bool simhands_wrist_ok[HAND_INDEX_MAX] = { false, false };
+	static Vector3 simhands_smooth[HAND_INDEX_MAX][21];
+	static bool simhands_smooth_ok[HAND_INDEX_MAX] = { false, false };
+	static int simhands_held[HAND_INDEX_MAX] = { 0, 0 };
+	static float simhands_maxfinger[HAND_INDEX_MAX] = { 0.0f, 0.0f };
 
 	for (uint32_t h = 0; h < frame.hand_count && h < 2; h++) {
 		const SimHandsPodHand &pod = frame.hands[h];
@@ -460,17 +606,76 @@ void VisionOSXRInterface::apply_simhands_hand_states() {
 			continue;
 		}
 
-		const Vector3 u0 = u_of(pod.lm[0]); // wrist
-		const Vector3 u9 = u_of(pod.lm[9]); // middle-finger knuckle
-		const float ref = Vector3(u9.x - u0.x, u9.y - u0.y, 0.0f).length(); // xy span (stable; z is noisy)
-		if (ref < 1e-4f) {
-			continue; // degenerate hand — skip
-		}
-		const float shape_scale = SIMHANDS_HAND_KNUCKLE_M / ref;
+		// --- Off-frame gating: hold each landmark's last IN-FRAME wrist-relative shape ---------------
+		// When a fingertip leaves the webcam frame MediaPipe extrapolates it to normalized x/y OUTSIDE
+		// [0,1]; mapped to metric that stretches the finger into a tendril. The hand-landmarker JSON has
+		// no usable per-landmark visibility, but off-frame IS directly detectable from the coords. For
+		// any off-frame (or non-finite) landmark, reuse its last in-frame wrist-relative offset so the
+		// finger keeps its last good shape. This bounds the WHOLE finger (not per-bone), is immune to
+		// foreshortening, and can never trigger on an in-frame curl -- unlike the reverted clamps
+		// (1a129ec collapsed toward the parent; 993d2c7 capped per-bone but 4 chained bones still
+		// drooped ~0.5 m cumulatively).
+		auto off_frame = [](const SimHandsLandmark &lm) -> bool {
+			const float M = 0.04f; // margin; extrapolated off-frame points land well outside [0,1]
+			return !(Math::is_finite(lm.x) && Math::is_finite(lm.y) && Math::is_finite(lm.z)) ||
+					lm.x < -M || lm.x > 1.0f + M || lm.y < -M || lm.y > 1.0f + M;
+		};
 
+		// Wrist anchor (absolute u) -- held if the wrist itself clips, so placement does not jump.
+		Vector3 u0;
+		if (!off_frame(pod.lm[0])) {
+			u0 = u_of(pod.lm[0]);
+			simhands_wrist_hold[side] = u0;
+			simhands_wrist_ok[side] = true;
+		} else if (simhands_wrist_ok[side]) {
+			u0 = simhands_wrist_hold[side];
+		} else {
+			u0 = u_of(pod.lm[0]); // first frames, wrist already off -- nothing better yet
+		}
+
+		// Per-landmark wrist-relative u, with hold. li runs 0..20 and SIMHANDS_PARENT[li] < li, so a
+		// parent's urel is always ready when a never-yet-valid child falls back onto it.
+		Vector3 urel[21];
+		int held = 0;
+		for (int li = 0; li < 21; li++) {
+			if (li == 0) {
+				urel[0] = Vector3();
+				continue;
+			}
+			if (!off_frame(pod.lm[li])) {
+				urel[li] = u_of(pod.lm[li]) - u0;
+				simhands_uhold[side][li] = urel[li];
+				simhands_uok[side][li] = true;
+			} else if (simhands_uok[side][li]) {
+				urel[li] = simhands_uhold[side][li]; // hold last in-frame shape
+				held++;
+			} else {
+				urel[li] = urel[SIMHANDS_PARENT[li]]; // never seen valid -> sit on the parent (no tendril)
+				held++;
+			}
+		}
+
+		// Self-normalize by the (now off-frame-robust) wrist->middle-knuckle xy span -> metric hand.
+		const float ref = Vector3(urel[9].x, urel[9].y, 0.0f).length();
+		if (ref < 1e-4f) {
+			continue; // degenerate hand -- skip
+		}
+		// Foreshortening guard: when the hand points toward the camera, the xy wrist->knuckle span
+		// (ref) collapses, so KNUCKLE/ref balloons and the whole hand (z especially) inflates into
+		// tendrils even with every landmark in-frame (observed: held=0 maxfinger=0.42 m). Floor ref so
+		// shape_scale can't blow up past ~1.6x nominal (nominal ref ~0.23 face-on; floor bites <0.14).
+		const float shape_scale = SIMHANDS_HAND_KNUCKLE_M / MAX(ref, 0.14f);
+
+		// Hand-scale → travel: a bigger hand should travel proportionally FARTHER for the same real-hand
+		// move. The u0-driven x/y placement (how far the wrist roams across the scene as the real hand
+		// crosses the webcam frame) scales with hand size relative to the nominal 0.09 m knuckle, so 2x
+		// hand scale → 2x travel (3 cm real → 6 cm in-game). The hand's internal size already scales via
+		// shape_scale (also knuckle-based), so the whole hand grows AND ranges together. Depth is a fixed
+		// standoff (weak monocular z carries no travel), so only x/y placement scales.
+		const float travel_scale = SIMHANDS_HAND_KNUCKLE_M / SIMHANDS_DEF_KNUCKLE_M;
 		const Vector3 wrist_place(
-				u0.x * SIMHANDS_PLANE_M,
-				u0.y * SIMHANDS_PLANE_M + SIMHANDS_Y_OFFSET_M,
+				u0.x * SIMHANDS_PLANE_M * travel_scale,
+				u0.y * SIMHANDS_PLANE_M * travel_scale + SIMHANDS_Y_OFFSET_M,
 				-SIMHANDS_DEPTH_M);
 
 		reset_hand_state((HandIndex)side);
@@ -478,62 +683,80 @@ void VisionOSXRInterface::apply_simhands_hand_states() {
 		state.tracked = true;
 		state.has_joint_data = true;
 
-		// Pass 1: metric joint positions (MediaPipe-indexed). +head_delta = WASD-follow translation.
+		// Metric joint positions (gated urel -> scaled -> placed; +head_delta = WASD-follow).
 		Vector3 jpos[21];
 		for (int li = 0; li < 21; li++) {
-			Vector3 rel = (u_of(pod.lm[li]) - u0) * shape_scale;
+			Vector3 rel = urel[li] * shape_scale;
 			rel.z *= SIMHANDS_Z_SHAPE_GAIN;
 			jpos[li] = wrist_place + rel + head_delta;
 		}
 
-		// --- Out-of-frame tendril guard -------------------------------------------------------------
-		// When a fingertip leaves the webcam frame MediaPipe extrapolates it to a garbage landmark far
-		// from the hand (its normalized x/y run outside [0,1]); mapped to metric, that bone stretches
-		// into a long tendril. The hand-landmarker model does NOT populate usable per-landmark
-		// visibility/presence (the helper forwards raw MediaPipe results and those fields are absent),
-		// so confidence-gating isn't possible — we reject by GEOMETRY and HOLD the last-good bone.
-		//
-		// Why not the reverted hard clamp (1a129ec, reverted in 8fd3536): it capped every phalanx at
-		// 0.6*knuckle (~0.054 m) in z-inflated metric space and PULLED each over-long bone toward its
-		// parent. On the flat, face-on canned hand nothing tripped, so it looked fine — but a real
-		// tilted/foreshortened hand shrinks the xy wrist->mid-knuckle span that sets shape_scale, so
-		// shape_scale balloons and NORMAL finger bones blow past 0.054; the clamp then yanked every
-		// finger into the palm each frame, collapsing the hand into a blob ("hands vanished"). This
-		// guard avoids that two ways: (1) a GENEROUS absolute ceiling (1.8*knuckle ~ 0.16 m — the
-		// longest real bone, wrist->MCP, is only ~1*knuckle) plus a per-bone RELATIVE jump test (bones
-		// are ~rigid, so >2.5x the last-good length = garbage), so normal/foreshortened bones are never
-		// touched; (2) on a hit it grafts the LAST-GOOD bone vector onto the (good) parent rather than
-		// collapsing toward it, so the finger stays plausible and the hand never disappears. All writes
-		// stay finite. Inert on good data -> normal poses are byte-identical to before.
-		const bool had_hist = simhands_have_hist[side];
-		const float max_seg = SIMHANDS_HAND_KNUCKLE_M * 1.8f;
-		int guard_hits = 0;
-		float max_bone = 0.0f;
-		for (int li = 1; li < 21; li++) {
-			const int par = SIMHANDS_PARENT[li];
-			const Vector3 bvec = jpos[li] - jpos[par];
-			const float blen = bvec.length();
-			const bool nonfinite = !(Math::is_finite(bvec.x) && Math::is_finite(bvec.y) && Math::is_finite(bvec.z));
-			const float lastlen = had_hist ? (simhands_lastgood[side][li] - simhands_lastgood[side][par]).length() : 0.0f;
-			const bool too_long = (blen > max_seg) || (had_hist && lastlen > 1e-4f && blen > 2.5f * lastlen);
-			if (nonfinite || too_long) {
-				if (had_hist) {
-					jpos[li] = jpos[par] + (simhands_lastgood[side][li] - simhands_lastgood[side][par]); // hold last-good bone
-				} else if (!nonfinite && blen > 1e-6f) {
-					jpos[li] = jpos[par] + bvec * (max_seg / blen); // bootstrap (no history yet): bounded clamp
-				} else {
-					jpos[li] = jpos[par]; // last resort: never NaN, never far — coincide with the parent
+		// --- Cumulative finger-length cap (the direct, cause-agnostic tendril bound) -----------------
+		// A per-bone cap can't bound a finger (it's 4 chained bones); foreshortening, off-frame
+		// extrapolation, or z-noise can each blow the wrist->tip total to 2-5x normal. Cap each
+		// finger's TOTAL length and scale its (original) bone vectors proportionally toward the wrist,
+		// preserving the finger's shape/direction -- never collapses (wrist + bone ratios kept). Normal
+		// wrist->tip ~0.18-0.22 m, so the cap only bites on pathological frames.
+		{
+			static const int chains[5][5] = { { 0, 1, 2, 3, 4 }, { 0, 5, 6, 7, 8 }, { 0, 9, 10, 11, 12 }, { 0, 13, 14, 15, 16 }, { 0, 17, 18, 19, 20 } };
+			const float max_finger = SIMHANDS_HAND_KNUCKLE_M * 2.7f; // ~0.24 m
+			for (int c = 0; c < 5; c++) {
+				Vector3 bone[5];
+				float total = 0.0f;
+				for (int k = 1; k < 5; k++) {
+					bone[k] = jpos[chains[c][k]] - jpos[chains[c][k - 1]];
+					total += bone[k].length();
 				}
-				guard_hits++;
+				if (total > max_finger && total > 1e-6f) {
+					const float s = max_finger / total;
+					for (int k = 1; k < 5; k++) {
+						jpos[chains[c][k]] = jpos[chains[c][k - 1]] + bone[k] * s; // parent already shrunk; use original bone
+					}
+				}
 			}
-			max_bone = MAX(max_bone, (jpos[li] - jpos[par]).length());
+		}
+
+		// --- Smoothing: velocity-adaptive EMA (one-euro-lite) --------------------------------------
+		// Raw MediaPipe is jittery at rest. Blend each joint toward its running value with an alpha
+		// that rises with the joint's frame-to-frame speed: still -> heavy smoothing (kills jitter),
+		// moving fast -> near pass-through (no lag for grabs). Seeded on the first frame per side.
+		if (simhands_smooth_ok[side]) {
+			// Map the slider s in [0,3] to an EMA. 0..1 is UNCHANGED (floor 1.0 -> 0.15, speed gain 12 so
+			// grabs stay low-lag). Past 1 it keeps getting smoother for slow, deliberate promo capture: the
+			// floor falls 0.15 -> 0.03 AND the speed gain falls 12 -> 2, so even FAST motion is damped (a
+			// glassy glide). lo/gain are per-hand (joint-independent) -> compute once.
+			const float s = CLAMP(SIMHANDS_SMOOTHING, 0.0f, 3.0f);
+			const float lo = (s <= 1.0f) ? (1.0f - 0.85f * s) // 0->1.0 (raw), 1->0.15 (heavy)
+										 : MAX(0.15f - 0.06f * (s - 1.0f), 0.03f); // 1->0.15, 3->0.03 (ultra)
+			const float gain = (s <= 1.0f) ? 12.0f : MAX(12.0f - 5.0f * (s - 1.0f), 2.0f); // 1->12, 3->2 (damp fast)
+			for (int li = 0; li < 21; li++) {
+				const Vector3 prev = simhands_smooth[side][li];
+				const float speed = (jpos[li] - prev).length();
+				const float alpha = CLAMP(lo + speed * gain, lo, 1.0f);
+				jpos[li] = prev.lerp(jpos[li], alpha);
+			}
 		}
 		for (int li = 0; li < 21; li++) {
-			simhands_lastgood[side][li] = jpos[li] - jpos[0]; // record this corrected (plausible) frame, wrist-relative
+			simhands_smooth[side][li] = jpos[li];
 		}
-		simhands_have_hist[side] = true;
-		simhands_guard_hits[side] = guard_hits;
-		simhands_maxbone[side] = max_bone;
+		simhands_smooth_ok[side] = true;
+
+		// Diagnostic: max CUMULATIVE finger length (wrist->tip) -- the metric that actually catches a
+		// tendril (a per-bone max does NOT: 4 chained bones each "under cap" still droop ~0.5 m).
+		// Normal ~0.18-0.22 m; a tendril is much larger.
+		{
+			static const int chains[5][5] = { { 0, 1, 2, 3, 4 }, { 0, 5, 6, 7, 8 }, { 0, 9, 10, 11, 12 }, { 0, 13, 14, 15, 16 }, { 0, 17, 18, 19, 20 } };
+			float maxf = 0.0f;
+			for (int c = 0; c < 5; c++) {
+				float len = 0.0f;
+				for (int k = 1; k < 5; k++) {
+					len += jpos[chains[c][k]].distance_to(jpos[chains[c][k - 1]]);
+				}
+				maxf = MAX(maxf, len);
+			}
+			simhands_maxfinger[side] = maxf;
+		}
+		simhands_held[side] = held;
 
 		// Palm normal (roll reference for every joint basis): wrist→index-knuckle × wrist→pinky-knuckle.
 		Vector3 palm_normal = (jpos[5] - jpos[0]).cross(jpos[17] - jpos[0]);
@@ -548,13 +771,52 @@ void VisionOSXRInterface::apply_simhands_hand_states() {
 			palm_normal = -palm_normal;
 		}
 
+		// --- Per-finger roll reference (fixes the mesh going inside-out on curl) --------------------
+		// simhands_basis_from_dir resolves each bone's roll from a reference "up". Using the single
+		// palm normal for EVERY joint flips the basis when a finger bone rotates parallel to it -- which
+		// is exactly what curling a finger does -> the skin winds inside-out. A finger instead curls in
+		// a stable PLANE whose normal stays perpendicular to its bones; use that as the roll reference.
+		// It degenerates only when the finger is straight, where we fall back to the palm normal
+		// (identical to before -> open/flat hands are unchanged). Sign-aligned to palm_normal so both
+		// hands stay consistent with the chirality handling above.
+		auto finger_roll = [&](int a, int b, int c) -> Vector3 {
+			Vector3 n = (jpos[b] - jpos[a]).cross(jpos[c] - jpos[b]);
+			if (n.length() < 1e-5f) {
+				return palm_normal; // straight finger -> no plane -> palm normal (unchanged behavior)
+			}
+			n = n.normalized();
+			return (n.dot(palm_normal) < 0.0f) ? -n : n;
+		};
+		Vector3 roll_ref[21];
+		roll_ref[0] = palm_normal; // wrist
+		const Vector3 r_thumb = finger_roll(1, 2, 3);
+		const Vector3 r_index = finger_roll(5, 6, 7);
+		const Vector3 r_middle = finger_roll(9, 10, 11);
+		const Vector3 r_ring = finger_roll(13, 14, 15);
+		const Vector3 r_pinky = finger_roll(17, 18, 19);
+		for (int li = 1; li <= 4; li++) {
+			roll_ref[li] = r_thumb;
+		}
+		for (int li = 5; li <= 8; li++) {
+			roll_ref[li] = r_index;
+		}
+		for (int li = 9; li <= 12; li++) {
+			roll_ref[li] = r_middle;
+		}
+		for (int li = 13; li <= 16; li++) {
+			roll_ref[li] = r_ring;
+		}
+		for (int li = 17; li <= 20; li++) {
+			roll_ref[li] = r_pinky;
+		}
+
 		// Pass 2: write each joint with position + synthesized orientation (+Y toward its child),
 		// anchored to the head (so the hand sits in front of the view, not pinned to the origin).
 		for (int li = 0; li < 21; li++) {
 			const Vector3 distal = jpos[SIMHANDS_DIR_TO[li]] - jpos[SIMHANDS_DIR_FROM[li]];
 			HandJointState &js = state.joints[SIMHANDS_JOINT_MAP[li]];
 			js.tracked = true;
-			js.transform = Transform3D(simhands_basis_from_dir(distal, palm_normal), jpos[li]);
+			js.transform = Transform3D(simhands_basis_from_dir(distal, roll_ref[li]), jpos[li]);
 			js.radius = 0.01f;
 		}
 
@@ -619,8 +881,8 @@ void VisionOSXRInterface::apply_simhands_hand_states() {
 			const Vector3 w = s.joints[XRHandTracker::HAND_JOINT_WRIST].transform.origin;
 			const float d = s.joints[XRHandTracker::HAND_JOINT_THUMB_TIP].transform.origin.distance_to(
 					s.joints[XRHandTracker::HAND_JOINT_INDEX_FINGER_TIP].transform.origin);
-			os_log(simhands_log(), "[SimHands] %{public}s tracked wrist=(%.2f, %.2f, %.2f) thumb-index=%.3fm pinch=%d maxbone=%.3fm guard=%d",
-					i == HAND_INDEX_LEFT ? "left" : "right", w.x, w.y, w.z, d, s.pinch_click ? 1 : 0, simhands_maxbone[i], simhands_guard_hits[i]);
+			os_log(simhands_log(), "[SimHands] %{public}s tracked wrist=(%.2f, %.2f, %.2f) thumb-index=%.3fm pinch=%d maxfinger=%.3fm held=%d",
+					i == HAND_INDEX_LEFT ? "left" : "right", w.x, w.y, w.z, d, s.pinch_click ? 1 : 0, simhands_maxfinger[i], simhands_held[i]);
 		}
 	}
 }
