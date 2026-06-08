@@ -1,0 +1,24 @@
+Godot visionOS Simulator Kit
+Copyright (c) 2026 Alex Coulombe (ibrews)
+Licensed under the MIT License (see LICENSE).
+
+================================================================================
+Third-party credits
+================================================================================
+
+VisionOS-SimHands — https://github.com/BenLumenDigital/VisionOS-SimHands
+  Copyright (c) Ben Harraway / Lumen Digital
+  Licensed under the Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0)
+
+  This kit interoperates with VisionOS-SimHands but does NOT include its source code:
+
+  - `engine/simhands_bridge.mm` and `tools/simhands_canned_sender.swift` are original works —
+    an independent ObjC++ / Swift re-implementation of the SimHands MultipeerConnectivity wire
+    protocol (serviceType "Bonjour", the 21-landmark `{landmarks, handednesses}` JSON shape, and
+    the MediaPipe left/right handedness swap). They speak the same protocol so SimHands' own macOS
+    helper — or this kit's canned sender — can feed them.
+  - To get REAL webcam hands you run SimHands' own macOS helper (Apache-2.0) unmodified. It is not
+    redistributed here; clone it from the link above.
+
+  Grateful credit to Ben Harraway for VisionOS-SimHands, which pioneered streaming MediaPipe webcam
+  hands into the visionOS Simulator and defined the protocol this kit's engine bridge consumes.

@@ -36,7 +36,28 @@ macOS helper (webcam), `../tools/simhands_canned_sender.swift` (canned loop, no 
 `../tools/SimControlPanel` (canned feed + on-demand pinch + live calibration). All three speak the
 same MultipeerConnectivity "Bonjour" contract (21-landmark JSON), so they're interchangeable.
 
+## Hand quality & behavior
+The bridge synthesizes a full articulated hand from MediaPipe's 21 landmarks:
+- **Joint orientations** are synthesized (each bone's `+Y` toward its child joint; palm normal sets
+  the roll) so the skinned hand mesh follows the fingers instead of twisting into a claw.
+- **Finger metacarpals** (which MediaPipe doesn't provide) are synthesized so the palm skin doesn't
+  stretch under the fingers; the **left hand's** mirrored chirality is corrected.
+- **WASD-follow:** hands translate with the head's *position* as you navigate the sim (position-only —
+  the head *rotation* in the sim doesn't match the rendered camera, so it isn't applied).
+- **Out-of-frame guard:** when a fingertip leaves the webcam frame, MediaPipe emits a garbage landmark
+  that would stretch the finger into a tendril; the bridge detects the bad bone (too long vs the hand
+  scale or vs its own last-good, or non-finite) and holds the last-good bone instead.
+
+Notes: the SimHands macOS helper's WKWebView **pauses MediaPipe when its window isn't frontmost**
+(macOS App Nap) — keep it visible; and only **one** "Bonjour" feed should run at a time (multiple
+senders fight frame-by-frame).
+
 ## Calibration
 Hand placement/scale is tuned live without rebuilds: the panel sends `K*` verbs on UDP 9999 →
 `simulator_input.gd` writes `user://simhands_calibration.cfg` → the bridge re-reads it ~9 Hz.
 `KR` resets to compiled defaults.
+
+## Credit
+The MultipeerConnectivity hand-stream approach is from
+[VisionOS-SimHands](https://github.com/BenLumenDigital/VisionOS-SimHands) by Ben Harraway (Apache-2.0).
+This bridge is an independent re-implementation of that protocol in the engine — see [`../NOTICE`](../NOTICE).

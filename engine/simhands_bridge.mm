@@ -29,6 +29,7 @@
 #if TARGET_OS_SIMULATOR
 
 #include "core/io/config_file.h"
+#include "core/math/math_funcs.h"
 #include "core/os/os.h"
 
 #import <Foundation/Foundation.h>
@@ -101,6 +102,11 @@ static const XRHandTracker::HandJoint SIMHANDS_JOINT_MAP[21] = {
 // distally, so we put +Y along this direction.
 static const int SIMHANDS_DIR_FROM[21] = { 0, 1, 2, 3, 3, 5, 6, 7, 7, 9, 10, 11, 11, 13, 14, 15, 15, 17, 18, 19, 19 };
 static const int SIMHANDS_DIR_TO[21] = { 9, 2, 3, 4, 4, 6, 7, 8, 8, 10, 11, 12, 12, 14, 15, 16, 16, 18, 19, 20, 20 };
+
+// Parent landmark of each MediaPipe joint along its finger chain (wrist=0 = root). Used by the
+// out-of-frame tendril guard (apply_simhands_hand_states) to test each bone segment against the
+// hand's own scale: index < li for every entry, so a wrist→tip walk clamps parents before children.
+static const int SIMHANDS_PARENT[21] = { -1, 0, 1, 2, 3, 0, 5, 6, 7, 0, 9, 10, 11, 0, 13, 14, 15, 0, 17, 18, 19 };
 
 // Plain-old-data carried from the MC delegate queue → the engine main thread.
 struct SimHandsLandmark {
@@ -414,7 +420,35 @@ void VisionOSXRInterface::apply_simhands_hand_states() {
 		return Vector3(0.5f - lm.x, 0.5f - lm.y, lm.z - 0.5f);
 	};
 
+	// WASD-follow: translate the hands by how far the head has MOVED since the first frame, so
+	// navigation carries them along and you can reach past the start position. POSITION-ONLY — we do
+	// NOT apply the head's rotation: the sim's head_tracker orientation doesn't match the rendered
+	// camera, so full head-anchoring threw the hands off-axis. Translation tracks WASD cleanly, and
+	// look-rotation (which barely moves the head position) leaves the hands put — no tilt artifacts.
+	static Vector3 simhands_head_baseline;
+	static bool simhands_baseline_set = false;
+	Vector3 head_delta;
+	if (head_tracker.is_valid()) {
+		Ref<XRPose> hp = head_tracker->get_pose(SNAME("default"));
+		if (hp.is_valid()) {
+			const Vector3 head_pos = hp->get_transform().origin;
+			if (!simhands_baseline_set) {
+				simhands_head_baseline = head_pos;
+				simhands_baseline_set = true;
+			}
+			head_delta = head_pos - simhands_head_baseline;
+		}
+	}
+
 	bool filled[HAND_INDEX_MAX] = { false, false };
+
+	// Out-of-frame tendril guard state, per side (see the guard block in the hand loop for the full
+	// rationale): last-good wrist-relative joint positions for temporal hold, plus two diagnostics
+	// (max bone length this frame, # of bones the guard corrected) surfaced in the os_log line.
+	static Vector3 simhands_lastgood[HAND_INDEX_MAX][21];
+	static bool simhands_have_hist[HAND_INDEX_MAX] = { false, false };
+	static int simhands_guard_hits[HAND_INDEX_MAX] = { 0, 0 };
+	static float simhands_maxbone[HAND_INDEX_MAX] = { 0.0f, 0.0f };
 
 	for (uint32_t h = 0; h < frame.hand_count && h < 2; h++) {
 		const SimHandsPodHand &pod = frame.hands[h];
@@ -444,13 +478,62 @@ void VisionOSXRInterface::apply_simhands_hand_states() {
 		state.tracked = true;
 		state.has_joint_data = true;
 
-		// Pass 1: metric joint positions (MediaPipe-indexed).
+		// Pass 1: metric joint positions (MediaPipe-indexed). +head_delta = WASD-follow translation.
 		Vector3 jpos[21];
 		for (int li = 0; li < 21; li++) {
 			Vector3 rel = (u_of(pod.lm[li]) - u0) * shape_scale;
 			rel.z *= SIMHANDS_Z_SHAPE_GAIN;
-			jpos[li] = wrist_place + rel;
+			jpos[li] = wrist_place + rel + head_delta;
 		}
+
+		// --- Out-of-frame tendril guard -------------------------------------------------------------
+		// When a fingertip leaves the webcam frame MediaPipe extrapolates it to a garbage landmark far
+		// from the hand (its normalized x/y run outside [0,1]); mapped to metric, that bone stretches
+		// into a long tendril. The hand-landmarker model does NOT populate usable per-landmark
+		// visibility/presence (the helper forwards raw MediaPipe results and those fields are absent),
+		// so confidence-gating isn't possible — we reject by GEOMETRY and HOLD the last-good bone.
+		//
+		// Why not the reverted hard clamp (1a129ec, reverted in 8fd3536): it capped every phalanx at
+		// 0.6*knuckle (~0.054 m) in z-inflated metric space and PULLED each over-long bone toward its
+		// parent. On the flat, face-on canned hand nothing tripped, so it looked fine — but a real
+		// tilted/foreshortened hand shrinks the xy wrist->mid-knuckle span that sets shape_scale, so
+		// shape_scale balloons and NORMAL finger bones blow past 0.054; the clamp then yanked every
+		// finger into the palm each frame, collapsing the hand into a blob ("hands vanished"). This
+		// guard avoids that two ways: (1) a GENEROUS absolute ceiling (1.8*knuckle ~ 0.16 m — the
+		// longest real bone, wrist->MCP, is only ~1*knuckle) plus a per-bone RELATIVE jump test (bones
+		// are ~rigid, so >2.5x the last-good length = garbage), so normal/foreshortened bones are never
+		// touched; (2) on a hit it grafts the LAST-GOOD bone vector onto the (good) parent rather than
+		// collapsing toward it, so the finger stays plausible and the hand never disappears. All writes
+		// stay finite. Inert on good data -> normal poses are byte-identical to before.
+		const bool had_hist = simhands_have_hist[side];
+		const float max_seg = SIMHANDS_HAND_KNUCKLE_M * 1.8f;
+		int guard_hits = 0;
+		float max_bone = 0.0f;
+		for (int li = 1; li < 21; li++) {
+			const int par = SIMHANDS_PARENT[li];
+			const Vector3 bvec = jpos[li] - jpos[par];
+			const float blen = bvec.length();
+			const bool nonfinite = !(Math::is_finite(bvec.x) && Math::is_finite(bvec.y) && Math::is_finite(bvec.z));
+			const float lastlen = had_hist ? (simhands_lastgood[side][li] - simhands_lastgood[side][par]).length() : 0.0f;
+			const bool too_long = (blen > max_seg) || (had_hist && lastlen > 1e-4f && blen > 2.5f * lastlen);
+			if (nonfinite || too_long) {
+				if (had_hist) {
+					jpos[li] = jpos[par] + (simhands_lastgood[side][li] - simhands_lastgood[side][par]); // hold last-good bone
+				} else if (!nonfinite && blen > 1e-6f) {
+					jpos[li] = jpos[par] + bvec * (max_seg / blen); // bootstrap (no history yet): bounded clamp
+				} else {
+					jpos[li] = jpos[par]; // last resort: never NaN, never far — coincide with the parent
+				}
+				guard_hits++;
+			}
+			max_bone = MAX(max_bone, (jpos[li] - jpos[par]).length());
+		}
+		for (int li = 0; li < 21; li++) {
+			simhands_lastgood[side][li] = jpos[li] - jpos[0]; // record this corrected (plausible) frame, wrist-relative
+		}
+		simhands_have_hist[side] = true;
+		simhands_guard_hits[side] = guard_hits;
+		simhands_maxbone[side] = max_bone;
 
 		// Palm normal (roll reference for every joint basis): wrist→index-knuckle × wrist→pinky-knuckle.
 		Vector3 palm_normal = (jpos[5] - jpos[0]).cross(jpos[17] - jpos[0]);
@@ -458,8 +541,15 @@ void VisionOSXRInterface::apply_simhands_hand_states() {
 			palm_normal = Vector3(0.0f, 0.0f, 1.0f);
 		}
 		palm_normal = palm_normal.normalized();
+		// The left hand is the mirror of the right, so the (index×pinky) palm normal comes out with
+		// the opposite sign — which inverts the left mesh. Flip it so both hands feed the rig the same
+		// basis chirality (the mesh driver's per-hand _bone_correction handles the rig mirror).
+		if (side == HAND_INDEX_LEFT) {
+			palm_normal = -palm_normal;
+		}
 
-		// Pass 2: write each joint with position + synthesized orientation (+Y toward its child).
+		// Pass 2: write each joint with position + synthesized orientation (+Y toward its child),
+		// anchored to the head (so the hand sits in front of the view, not pinned to the origin).
 		for (int li = 0; li < 21; li++) {
 			const Vector3 distal = jpos[SIMHANDS_DIR_TO[li]] - jpos[SIMHANDS_DIR_FROM[li]];
 			HandJointState &js = state.joints[SIMHANDS_JOINT_MAP[li]];
@@ -477,6 +567,25 @@ void VisionOSXRInterface::apply_simhands_hand_states() {
 		state.default_transform = palm.transform;
 		state.aim_transform = palm.transform;
 		state.grip_transform = state.joints[XRHandTracker::HAND_JOINT_WRIST].transform;
+
+		// Finger metacarpals (Godot 6/11/16/21) have no MediaPipe landmark, so without posing them
+		// the palm bones stay at rest while wrist+knuckles move → the skin under the fingers stretches.
+		// Synthesize each: a point partway up the palm from the wrist toward that finger's knuckle
+		// (MCP), oriented toward the knuckle. (mediapipe wrist=0; index/middle/ring/pinky MCP=5/9/13/17.)
+		const XRHandTracker::HandJoint meta_joint[4] = {
+			XRHandTracker::HAND_JOINT_INDEX_FINGER_METACARPAL,
+			XRHandTracker::HAND_JOINT_MIDDLE_FINGER_METACARPAL,
+			XRHandTracker::HAND_JOINT_RING_FINGER_METACARPAL,
+			XRHandTracker::HAND_JOINT_PINKY_FINGER_METACARPAL,
+		};
+		const int meta_knuckle_lm[4] = { 5, 9, 13, 17 };
+		for (int m = 0; m < 4; m++) {
+			const Vector3 knuckle = jpos[meta_knuckle_lm[m]];
+			HandJointState &mj = state.joints[meta_joint[m]];
+			mj.tracked = true;
+			mj.transform = Transform3D(simhands_basis_from_dir(knuckle - jpos[0], palm_normal), jpos[0].lerp(knuckle, 0.25f));
+			mj.radius = 0.01f;
+		}
 
 		// Pinch (thumb tip ↔ index tip) → controller-tracker trigger proxy.
 		const Vector3 thumb = state.joints[XRHandTracker::HAND_JOINT_THUMB_TIP].transform.origin;
@@ -510,8 +619,8 @@ void VisionOSXRInterface::apply_simhands_hand_states() {
 			const Vector3 w = s.joints[XRHandTracker::HAND_JOINT_WRIST].transform.origin;
 			const float d = s.joints[XRHandTracker::HAND_JOINT_THUMB_TIP].transform.origin.distance_to(
 					s.joints[XRHandTracker::HAND_JOINT_INDEX_FINGER_TIP].transform.origin);
-			os_log(simhands_log(), "[SimHands] %{public}s tracked wrist=(%.2f, %.2f, %.2f) thumb-index=%.3fm pinch=%d",
-					i == HAND_INDEX_LEFT ? "left" : "right", w.x, w.y, w.z, d, s.pinch_click ? 1 : 0);
+			os_log(simhands_log(), "[SimHands] %{public}s tracked wrist=(%.2f, %.2f, %.2f) thumb-index=%.3fm pinch=%d maxbone=%.3fm guard=%d",
+					i == HAND_INDEX_LEFT ? "left" : "right", w.x, w.y, w.z, d, s.pinch_click ? 1 : 0, simhands_maxbone[i], simhands_guard_hits[i]);
 		}
 	}
 }
