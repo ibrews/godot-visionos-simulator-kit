@@ -1,0 +1,60 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:1200px;height:630px;overflow:hidden}
+  body{
+    font-family:'Space Grotesk',sans-serif;color:#fff;
+    background:
+      radial-gradient(800px 600px at 12% 60%, rgba(123,108,255,.28), transparent 60%),
+      radial-gradient(700px 520px at 92% 6%, rgba(40,200,200,.22), transparent 58%),
+      #060810;
+    display:flex;align-items:center;padding:64px 70px;gap:48px;position:relative}
+  .stars{position:absolute;inset:0;background-image:
+    radial-gradient(1.4px 1.4px at 20% 30%, #fff7, transparent),
+    radial-gradient(1.2px 1.2px at 70% 20%, #fff5, transparent),
+    radial-gradient(1.3px 1.3px at 85% 70%, #bcd6ff8a, transparent),
+    radial-gradient(1px 1px at 35% 80%, #fff4, transparent),
+    radial-gradient(1.2px 1.2px at 55% 50%, #fff4, transparent);}
+  .left{flex:1;z-index:2}
+  .tag{font-size:19px;letter-spacing:.32em;text-transform:uppercase;color:#7fe6e0;font-weight:500;margin-bottom:22px}
+  h1{font-size:74px;line-height:1.02;font-weight:700;letter-spacing:-.02em;
+    background:linear-gradient(130deg,#fff 18%,#a5d8ff 55%,#9b8cff 92%);
+    -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .tagline{font-size:25px;line-height:1.4;color:#c4cbe0;margin-top:24px;max-width:560px;font-weight:400}
+  .pill{display:inline-block;margin-top:30px;padding:11px 20px;border:1px solid #ffffff26;border-radius:999px;
+    font-size:18px;color:#dfe6f5;background:#ffffff0a}
+  .right{width:430px;z-index:2}
+  .term{background:#0a0e1ad9;border:1px solid #ffffff1f;border-radius:14px;overflow:hidden;box-shadow:0 24px 70px #000a}
+  .bar{display:flex;gap:8px;padding:13px 16px;background:#ffffff0d;border-bottom:1px solid #ffffff12}
+  .dot{width:12px;height:12px;border-radius:50%}
+  .body{padding:20px 22px;font-family:'JetBrains Mono',monospace;font-size:18px;line-height:1.85}
+  .c{color:#6b7392}.g{color:#7fe6a0}.b{color:#8ab4ff}.v{color:#c4a6ff}.w{color:#e8ecf7}
+  .foot{position:absolute;left:70px;right:70px;bottom:40px;display:flex;justify-content:space-between;
+    font-size:15px;letter-spacing:.18em;text-transform:uppercase;color:#8a93ad;z-index:2}
+</style></head>
+<body>
+  <div class="stars"></div>
+  <div class="left">
+    <div class="tag">Godot · Apple Vision Pro</div>
+    <h1>Godot visionOS<br>Simulator Kit</h1>
+    <div class="tagline">Develop &amp; test Godot visionOS apps in the Simulator — working input, hand-tracking, and a one-command sim/device build switcher.</div>
+    <div class="pill">🥽 prototype in the sim, not on a headset round-trip</div>
+  </div>
+  <div class="right">
+    <div class="term">
+      <div class="bar"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span></div>
+      <div class="body">
+        <div><span class="g">$</span> <span class="w">./build.sh</span> <span class="b">sim</span></div>
+        <div class="c">▶ export .pck → xcodebuild</div>
+        <div class="c">▶ simctl install + launch</div>
+        <div><span class="v">✓</span> <span class="c">running in the Simulator</span></div>
+        <div>&nbsp;</div>
+        <div><span class="g">$</span> <span class="w">./build.sh</span> <span class="b">device</span></div>
+        <div class="c">▶ signed → Apple Vision Pro</div>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><span>github.com/ibrews · MIT</span><span>build switch · sim input · hands</span></div>
+</body></html>
