@@ -1,0 +1,13 @@
+# build.config — per-project values for build.sh. Copy to `build.config` and fill in.
+# (build.config is gitignored; this .example is the template.) Every key is also overridable
+# as an env var. Below is a worked example from the Cascade Countdown project.
+
+GODOT="$HOME/godot-visionos-pilot/Godot.app/Contents/MacOS/Godot"   # your Godot visionOS editor binary
+PROJECT_DIR="$PWD/test-project"            # the Godot project (folder with project.godot)
+EXPORT_PRESET="visionOS"                   # name="..." in export_presets.cfg
+XCODE_DIR="$PWD/out/xcode-visionos"        # the Godot-exported Xcode project dir
+SCHEME="GodotVisionPilot"                  # Xcode scheme (== the .xcodeproj name without extension)
+BUNDLE_ID="com.agilelens.godotvisionpilot"
+SIM_UDID="A540B3B5-CB1D-477D-A3B9-A6D41598B704"   # xcrun simctl list devices  (your Apple Vision Pro sim)
+DEVICE_ID="2642855C-6B73-5D5B-9387-6B110E7A7CF3"  # xcrun devicectl list devices  (your paired headset)
+DEV_TEAM="C624J4S2F8"                      # Apple Developer team id (device signing)

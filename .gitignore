@@ -1,0 +1,16 @@
+# per-project config (copy build.config.example → build.config)
+build.config
+
+# macOS
+.DS_Store
+
+# Swift / Xcode build artifacts
+.build/
+*.app/
+DerivedData/
+
+# compiled helper binaries (build from the .swift sources)
+/tools/siminputtap
+/tools/sender
+/tools/simhands_canned_sender
+/tools/SimControlPanel/SimControlPanel
