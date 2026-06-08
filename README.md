@@ -53,7 +53,7 @@ Everything project-specific lives in `build.config` (or env vars), so the script
 
 Why immersive Godot apps get no sim input or hands, the rendering fixes to build Godot for the visionOS sim at all, and the full design notes live in the Cascade Countdown wiki: [Build and Deploy](https://github.com/ibrews/godot-avp-cascade/wiki/Build-and-Deploy) · [visionOS Gotchas](https://github.com/ibrews/godot-avp-cascade/wiki/visionOS-Gotchas).
 
-Built by **Alex Coulombe**. The SimHands engine bridge interoperates with **[VisionOS-SimHands](https://github.com/BenLumenDigital/VisionOS-SimHands)** by Ben Lumen Digital (webcam hand-tracking for the visionOS Simulator). visionOS hand-tracking engine support rides on **[Clancey/godot](https://github.com/Clancey/godot/tree/visionos_master_pr)** (Marshall Nowak). "Godot" is a trademark of the Godot Foundation; this kit is independent and not affiliated.
+Built by **Alex Coulombe**. The SimHands engine bridge interoperates with **[VisionOS-SimHands](https://github.com/BenLumenDigital/VisionOS-SimHands)** by Ben Lumen Digital (webcam hand-tracking for the visionOS Simulator). visionOS hand-tracking engine support rides on **[Clancey/godot](https://github.com/Clancey/godot/tree/visionos_master_pr)** (James Clancey). "Godot" is a trademark of the Godot Foundation; this kit is independent and not affiliated.
 
 ## License
 
